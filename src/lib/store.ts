@@ -127,7 +127,14 @@ export const useMissionControl = create<MissionControlState>((set) => ({
   },
   addTask: (task) => {
     debug.store('addTask called', { id: task.id, title: task.title });
-    set((state) => ({ tasks: [task, ...state.tasks] }));
+    set((state) => {
+      // Dedupe: don't add if already exists
+      if (state.tasks.some((t) => t.id === task.id)) {
+        debug.store('Task already exists, skipping add', { id: task.id });
+        return state;
+      }
+      return { tasks: [task, ...state.tasks] };
+    });
   },
 
   // Agent mutations

@@ -2,7 +2,7 @@
 
 export type AgentStatus = 'standby' | 'working' | 'offline';
 
-export type TaskStatus = 'inbox' | 'assigned' | 'in_progress' | 'review' | 'done';
+export type TaskStatus = 'inbox' | 'assigned' | 'in_progress' | 'testing' | 'review' | 'done';
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
 

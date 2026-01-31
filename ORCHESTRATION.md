@@ -17,8 +17,16 @@ Or use the `MISSION_CONTROL_URL` environment variable.
 ## Task Lifecycle
 
 ```
-INBOX → ASSIGNED → IN_PROGRESS → REVIEW → DONE
+INBOX → ASSIGNED → IN_PROGRESS → TESTING → REVIEW → DONE
 ```
+
+**Status Descriptions:**
+- **INBOX**: New tasks awaiting processing
+- **ASSIGNED**: Task assigned to an agent, ready to be worked on
+- **IN_PROGRESS**: Agent actively working on the task
+- **TESTING**: Automated quality gate - runs browser tests, CSS validation, resource checks
+- **REVIEW**: Passed automated tests, awaiting human approval
+- **DONE**: Task completed and approved
 
 ## When You Receive a Task
 

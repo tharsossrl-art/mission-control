@@ -38,12 +38,12 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Task not found' }, { status: 404 });
       }
 
-      // Only move to review if not already in review or done
-      // (Don't overwrite user's approval)
-      if (task.status !== 'review' && task.status !== 'done') {
+      // Only move to testing if not already in testing, review, or done
+      // (Don't overwrite user's approval or testing results)
+      if (task.status !== 'testing' && task.status !== 'review' && task.status !== 'done') {
         run(
           'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?',
-          ['review', now, task.id]
+          ['testing', now, task.id]
         );
       }
 
@@ -72,8 +72,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         success: true,
         task_id: task.id,
-        new_status: 'review',
-        message: 'Task moved to review'
+        new_status: 'testing',
+        message: 'Task moved to testing for automated verification'
       });
     }
 
@@ -122,12 +122,12 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      // Only move to review if not already in review or done
-      // (Don't overwrite user's approval)
-      if (task.status !== 'review' && task.status !== 'done') {
+      // Only move to testing if not already in testing, review, or done
+      // (Don't overwrite user's approval or testing results)
+      if (task.status !== 'testing' && task.status !== 'review' && task.status !== 'done') {
         run(
           'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?',
-          ['review', now, task.id]
+          ['testing', now, task.id]
         );
       }
 
@@ -156,8 +156,8 @@ export async function POST(request: NextRequest) {
         task_id: task.id,
         agent_id: session.agent_id,
         summary,
-        new_status: 'review',
-        message: 'Task moved to review'
+        new_status: 'testing',
+        message: 'Task moved to testing for automated verification'
       });
     }
 

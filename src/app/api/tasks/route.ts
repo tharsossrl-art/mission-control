@@ -26,8 +26,15 @@ export async function GET(request: NextRequest) {
     const params: unknown[] = [];
 
     if (status) {
-      sql += ' AND t.status = ?';
-      params.push(status);
+      // Support comma-separated status values (e.g., status=inbox,testing,in_progress)
+      const statuses = status.split(',').map(s => s.trim()).filter(Boolean);
+      if (statuses.length === 1) {
+        sql += ' AND t.status = ?';
+        params.push(statuses[0]);
+      } else if (statuses.length > 1) {
+        sql += ` AND t.status IN (${statuses.map(() => '?').join(',')})`;
+        params.push(...statuses);
+      }
     }
     if (businessId) {
       sql += ' AND t.business_id = ?';
@@ -65,8 +72,10 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body: CreateTaskRequest = await request.json();
+    console.log('[POST /api/tasks] Received body:', JSON.stringify(body));
 
     if (!body.title) {
+      console.log('[POST /api/tasks] Title missing or empty');
       return NextResponse.json({ error: 'Title is required' }, { status: 400 });
     }
 

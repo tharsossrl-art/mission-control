@@ -19,12 +19,12 @@ curl -s http://YOUR_SERVER_IP:3000/api/tasks?status=inbox
 
 If tasks exist in INBOX, process them. If not, check REVIEW tasks.
 
-### Step 2: Check REVIEW tasks (Auto-Test)
+### Step 2: Check TESTING tasks (Auto-Test)
 ```bash
-curl -s http://YOUR_SERVER_IP:3000/api/tasks?status=review
+curl -s http://YOUR_SERVER_IP:3000/api/tasks?status=testing
 ```
 
-For each REVIEW task, run automated tests before human review:
+For each TESTING task, run automated tests before human review:
 ```bash
 curl -X POST http://YOUR_SERVER_IP:3000/api/tasks/{TASK_ID}/test
 ```
@@ -32,10 +32,13 @@ curl -X POST http://YOUR_SERVER_IP:3000/api/tasks/{TASK_ID}/test
 The test endpoint will:
 - Load HTML deliverables in a headless browser
 - Check for JavaScript console errors
+- Validate CSS syntax (via css-tree)
+- Check for broken resources (images, scripts, stylesheets)
+- Support URL deliverables (HTTP test for PHP/Python, file:// for static)
 - Take screenshots
 - Return pass/fail results
 
-**If tests PASS:** Task stays in REVIEW with activity log "✅ Automated test passed"
+**If tests PASS:** Task moves to REVIEW with activity log showing success
 **If tests FAIL:** Task auto-moves to ASSIGNED with activity log showing errors
 
 ### Step 3: Check IN_PROGRESS tasks
@@ -43,7 +46,20 @@ The test endpoint will:
 curl -s http://YOUR_SERVER_IP:3000/api/tasks?status=in_progress
 ```
 
-For each IN_PROGRESS task, check if work is complete and move to REVIEW.
+For each IN_PROGRESS task, check if work is complete and move to TESTING.
+
+### Step 4: Check ASSIGNED tasks (Rework Loop)
+```bash
+curl -s http://YOUR_SERVER_IP:3000/api/tasks?status=assigned
+```
+
+For each ASSIGNED task, this means it failed automated testing and needs rework:
+1. Check the task's activity log for failure reasons
+2. Move task to IN_PROGRESS
+3. Spawn a sub-agent to fix the issues
+4. After fixes, the agent completion webhook moves it back to TESTING
+
+This creates the rework loop: `TESTING (fail) → ASSIGNED → IN_PROGRESS → TESTING`
 
 ## When Processing a New INBOX Task
 

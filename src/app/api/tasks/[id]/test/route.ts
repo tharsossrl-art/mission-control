@@ -2,15 +2,34 @@
  * Task Test API
  * Runs automated browser tests on task deliverables
  * Called by orchestrating LLM (Charlie) to verify work before human review
+ *
+ * Enhanced validations:
+ * - JavaScript console error detection
+ * - CSS syntax validation (via css-tree)
+ * - Link/resource validation (img src, script src, link href)
+ * - URL deliverable support (HTTP test for dynamic, file:// for static)
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import { chromium } from 'playwright';
 import { queryOne, queryAll, run } from '@/lib/db';
 import { v4 as uuidv4 } from 'uuid';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
 import path from 'path';
+import * as csstree from 'css-tree';
 import type { Task, TaskDeliverable } from '@/lib/types';
+
+interface CssValidationError {
+  message: string;
+  line?: number;
+  column?: number;
+}
+
+interface ResourceError {
+  type: 'image' | 'script' | 'stylesheet' | 'link' | 'other';
+  url: string;
+  error: string;
+}
 
 interface TestResult {
   passed: boolean;
@@ -18,10 +37,13 @@ interface TestResult {
     id: string;
     title: string;
     path: string;
+    type: 'file' | 'url';
   };
   httpStatus: number | null;
   consoleErrors: string[];
   consoleWarnings: string[];
+  cssErrors: CssValidationError[];
+  resourceErrors: ResourceError[];
   screenshotPath: string | null;
   duration: number;
   error?: string;
@@ -34,6 +56,7 @@ interface TestResponse {
   results: TestResult[];
   summary: string;
   testedAt: string;
+  newStatus?: string;
 }
 
 const SCREENSHOTS_DIR = '${PROJECTS_PATH}/.screenshots';
@@ -41,6 +64,11 @@ const SCREENSHOTS_DIR = '${PROJECTS_PATH}/.screenshots';
 /**
  * POST /api/tasks/[id]/test
  * Run automated browser tests on all deliverables for a task
+ *
+ * Enhanced workflow:
+ * - Runs on tasks in 'testing' status (moved there after agent completion)
+ * - PASS -> moves to 'review' for human approval
+ * - FAIL -> moves to 'assigned' for agent to fix
  */
 export async function POST(
   request: NextRequest,
@@ -57,15 +85,15 @@ export async function POST(
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
 
-    // Get deliverables
+    // Get all deliverables (file and url types)
     const deliverables = queryAll<TaskDeliverable>(
-      'SELECT * FROM task_deliverables WHERE task_id = ? AND deliverable_type = ?',
-      [taskId, 'file']
+      'SELECT * FROM task_deliverables WHERE task_id = ? AND deliverable_type IN (?, ?)',
+      [taskId, 'file', 'url']
     );
 
     if (deliverables.length === 0) {
       return NextResponse.json(
-        { error: 'No file deliverables to test' },
+        { error: 'No testable deliverables found (file or url types)' },
         { status: 400 }
       );
     }
@@ -93,19 +121,23 @@ export async function POST(
     // Build summary
     let summary: string;
     if (passed) {
-      summary = `✅ All ${results.length} deliverable(s) passed automated testing. No console errors detected.`;
+      summary = `All ${results.length} deliverable(s) passed automated testing. No console errors, CSS errors, or broken resources detected.`;
     } else {
-      const errors = results
-        .filter(r => !r.passed)
-        .map(r => `${r.deliverable.title}: ${r.consoleErrors.length} errors`)
-        .join(', ');
-      summary = `❌ ${failedCount}/${results.length} deliverable(s) failed. Issues: ${errors}`;
+      const issues: string[] = [];
+      for (const r of results.filter(r => !r.passed)) {
+        const errorTypes: string[] = [];
+        if (r.consoleErrors.length > 0) errorTypes.push(`${r.consoleErrors.length} JS errors`);
+        if (r.cssErrors.length > 0) errorTypes.push(`${r.cssErrors.length} CSS errors`);
+        if (r.resourceErrors.length > 0) errorTypes.push(`${r.resourceErrors.length} broken resources`);
+        issues.push(`${r.deliverable.title}: ${errorTypes.join(', ')}`);
+      }
+      summary = `${failedCount}/${results.length} deliverable(s) failed. Issues: ${issues.join('; ')}`;
     }
 
     // Log activity
     const activityMessage = passed
-      ? `✅ Automated test passed - ${results.length} deliverable(s) verified, no console errors`
-      : `❌ Automated test failed - ${summary}`;
+      ? `Automated test passed - ${results.length} deliverable(s) verified, no issues found`
+      : `Automated test failed - ${summary}`;
 
     run(
       `INSERT INTO task_activities (id, task_id, activity_type, message, metadata, created_at)
@@ -117,20 +149,28 @@ export async function POST(
         activityMessage,
         JSON.stringify({ results: results.map(r => ({
           deliverable: r.deliverable.title,
+          type: r.deliverable.type,
           passed: r.passed,
-          errors: r.consoleErrors.length,
+          consoleErrors: r.consoleErrors.length,
+          cssErrors: r.cssErrors.length,
+          resourceErrors: r.resourceErrors.length,
           screenshot: r.screenshotPath
         })) }),
         new Date().toISOString()
       ]
     );
 
-    // If failed, move back to assigned
-    if (!passed) {
+    // Update task status based on results
+    const now = new Date().toISOString();
+    let newStatus: string | undefined;
+
+    if (passed) {
+      // Tests passed -> move to review for human approval
       run(
         'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?',
-        ['assigned', new Date().toISOString(), taskId]
+        ['review', now, taskId]
       );
+      newStatus = 'review';
 
       run(
         `INSERT INTO task_activities (id, task_id, activity_type, message, created_at)
@@ -139,8 +179,27 @@ export async function POST(
           uuidv4(),
           taskId,
           'status_changed',
-          'Task moved back to ASSIGNED due to failed automated tests',
-          new Date().toISOString()
+          'Task moved to REVIEW - automated tests passed, awaiting human approval',
+          now
+        ]
+      );
+    } else {
+      // Tests failed -> move back to assigned for agent to fix
+      run(
+        'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?',
+        ['assigned', now, taskId]
+      );
+      newStatus = 'assigned';
+
+      run(
+        `INSERT INTO task_activities (id, task_id, activity_type, message, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          uuidv4(),
+          taskId,
+          'status_changed',
+          'Task moved back to ASSIGNED due to failed automated tests - agent needs to fix issues',
+          now
         ]
       );
     }
@@ -151,7 +210,8 @@ export async function POST(
       passed,
       results,
       summary,
-      testedAt: new Date().toISOString()
+      testedAt: new Date().toISOString(),
+      newStatus
     };
 
     return NextResponse.json(response);
@@ -164,6 +224,63 @@ export async function POST(
   }
 }
 
+/**
+ * Validate CSS syntax using css-tree
+ */
+function validateCss(css: string): CssValidationError[] {
+  const errors: CssValidationError[] = [];
+
+  try {
+    csstree.parse(css, {
+      parseAtrulePrelude: false,
+      parseRulePrelude: false,
+      parseValue: false,
+      onParseError: (error) => {
+        // SyntaxParseError has offset, rawMessage, formattedMessage
+        // We can calculate line/column from offset if needed
+        errors.push({
+          message: error.rawMessage || error.message
+        });
+      }
+    });
+  } catch (error) {
+    errors.push({
+      message: `CSS parse error: ${error instanceof Error ? error.message : String(error)}`
+    });
+  }
+
+  return errors;
+}
+
+/**
+ * Extract and validate inline CSS from HTML content
+ */
+function extractAndValidateCss(htmlContent: string): CssValidationError[] {
+  const errors: CssValidationError[] = [];
+
+  // Extract <style> tag contents
+  const styleRegex = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+  let match;
+
+  while ((match = styleRegex.exec(htmlContent)) !== null) {
+    const cssContent = match[1];
+    const cssErrors = validateCss(cssContent);
+    errors.push(...cssErrors);
+  }
+
+  return errors;
+}
+
+/**
+ * Determine if a URL is testable via HTTP (dynamic content) or should use file://
+ */
+function isHttpUrl(url: string): boolean {
+  return url.startsWith('http://') || url.startsWith('https://');
+}
+
+/**
+ * Test a single deliverable
+ */
 async function testDeliverable(
   browser: Awaited<ReturnType<typeof chromium.launch>>,
   deliverable: TaskDeliverable,
@@ -172,44 +289,94 @@ async function testDeliverable(
   const startTime = Date.now();
   const consoleErrors: string[] = [];
   const consoleWarnings: string[] = [];
+  const resourceErrors: ResourceError[] = [];
+  let cssErrors: CssValidationError[] = [];
   let httpStatus: number | null = null;
   let screenshotPath: string | null = null;
 
+  const isUrlDeliverable = deliverable.deliverable_type === 'url';
+  const testPath = deliverable.path || '';
+
   try {
-    // Check file exists
-    if (!deliverable.path || !existsSync(deliverable.path)) {
-      return {
-        passed: false,
-        deliverable: {
-          id: deliverable.id,
-          title: deliverable.title,
-          path: deliverable.path || 'unknown'
-        },
-        httpStatus: null,
-        consoleErrors: [`File does not exist: ${deliverable.path}`],
-        consoleWarnings: [],
-        screenshotPath: null,
-        duration: Date.now() - startTime,
-        error: 'File not found'
-      };
+    // For file deliverables, check file exists
+    if (!isUrlDeliverable) {
+      if (!testPath || !existsSync(testPath)) {
+        return {
+          passed: false,
+          deliverable: {
+            id: deliverable.id,
+            title: deliverable.title,
+            path: testPath || 'unknown',
+            type: 'file'
+          },
+          httpStatus: null,
+          consoleErrors: [`File does not exist: ${testPath}`],
+          consoleWarnings: [],
+          cssErrors: [],
+          resourceErrors: [],
+          screenshotPath: null,
+          duration: Date.now() - startTime,
+          error: 'File not found'
+        };
+      }
+
+      // Skip non-HTML files for browser testing
+      if (!testPath.endsWith('.html') && !testPath.endsWith('.htm')) {
+        return {
+          passed: true,
+          deliverable: {
+            id: deliverable.id,
+            title: deliverable.title,
+            path: testPath,
+            type: 'file'
+          },
+          httpStatus: null,
+          consoleErrors: [],
+          consoleWarnings: [],
+          cssErrors: [],
+          resourceErrors: [],
+          screenshotPath: null,
+          duration: Date.now() - startTime,
+          error: 'Skipped - not an HTML file'
+        };
+      }
+
+      // Validate CSS in file before browser test
+      const htmlContent = readFileSync(testPath, 'utf-8');
+      cssErrors = extractAndValidateCss(htmlContent);
     }
 
-    // Only test HTML files
-    if (!deliverable.path.endsWith('.html') && !deliverable.path.endsWith('.htm')) {
-      return {
-        passed: true,
-        deliverable: {
-          id: deliverable.id,
-          title: deliverable.title,
-          path: deliverable.path
-        },
-        httpStatus: null,
-        consoleErrors: [],
-        consoleWarnings: [],
-        screenshotPath: null,
-        duration: Date.now() - startTime,
-        error: 'Skipped - not an HTML file'
-      };
+    // For URL deliverables, determine test approach
+    let testUrl: string;
+    if (isUrlDeliverable) {
+      if (isHttpUrl(testPath)) {
+        // HTTP URL - test directly
+        testUrl = testPath;
+      } else {
+        // Treat as file path
+        if (!existsSync(testPath)) {
+          return {
+            passed: false,
+            deliverable: {
+              id: deliverable.id,
+              title: deliverable.title,
+              path: testPath,
+              type: 'url'
+            },
+            httpStatus: null,
+            consoleErrors: [`URL path does not exist: ${testPath}`],
+            consoleWarnings: [],
+            cssErrors: [],
+            resourceErrors: [],
+            screenshotPath: null,
+            duration: Date.now() - startTime,
+            error: 'Path not found'
+          };
+        }
+        testUrl = `file://${testPath}`;
+      }
+    } else {
+      testUrl = `file://${testPath}`;
     }
 
     const context = await browser.newContext();
@@ -229,14 +396,37 @@ async function testDeliverable(
       consoleErrors.push(`Page error: ${error.message}`);
     });
 
-    // Load page via file:// protocol
-    const fileUrl = `file://${deliverable.path}`;
-    const response = await page.goto(fileUrl, {
+    // Capture failed resource requests
+    page.on('requestfailed', request => {
+      const url = request.url();
+      const failure = request.failure();
+      const resourceType = request.resourceType();
+
+      let type: ResourceError['type'] = 'other';
+      if (resourceType === 'image') type = 'image';
+      else if (resourceType === 'script') type = 'script';
+      else if (resourceType === 'stylesheet') type = 'stylesheet';
+      else if (resourceType === 'document') type = 'link';
+
+      resourceErrors.push({
+        type,
+        url,
+        error: failure?.errorText || 'Request failed'
+      });
+    });
+
+    // Load page
+    const response = await page.goto(testUrl, {
       waitUntil: 'networkidle',
       timeout: 30000
     });
 
     httpStatus = response?.status() || null;
+
+    // For HTTP URLs, check for non-success status codes
+    if (isHttpUrl(testUrl) && httpStatus && (httpStatus < 200 || httpStatus >= 400)) {
+      consoleErrors.push(`HTTP error: Server returned status ${httpStatus}`);
+    }
 
     // Wait a bit for any async JS to run
     await page.waitForTimeout(1000);
@@ -248,19 +438,23 @@ async function testDeliverable(
 
     await context.close();
 
-    // Determine pass/fail (no console errors = pass)
-    const passed = consoleErrors.length === 0;
+    // Determine pass/fail
+    // Fail conditions: console errors, CSS errors, or resource loading errors
+    const passed = consoleErrors.length === 0 && cssErrors.length === 0 && resourceErrors.length === 0;
 
     return {
       passed,
       deliverable: {
         id: deliverable.id,
         title: deliverable.title,
-        path: deliverable.path
+        path: testPath,
+        type: isUrlDeliverable ? 'url' : 'file'
       },
       httpStatus,
       consoleErrors,
       consoleWarnings,
+      cssErrors,
+      resourceErrors,
       screenshotPath,
       duration: Date.now() - startTime
     };
@@ -270,11 +464,14 @@ async function testDeliverable(
       deliverable: {
         id: deliverable.id,
         title: deliverable.title,
-        path: deliverable.path || 'unknown'
+        path: testPath || 'unknown',
+        type: isUrlDeliverable ? 'url' : 'file'
       },
       httpStatus,
       consoleErrors: [...consoleErrors, `Test error: ${error}`],
       consoleWarnings,
+      cssErrors,
+      resourceErrors,
       screenshotPath,
       duration: Date.now() - startTime,
       error: String(error)
@@ -298,22 +495,37 @@ export async function GET(
   }
 
   const deliverables = queryAll<TaskDeliverable>(
-    'SELECT * FROM task_deliverables WHERE task_id = ? AND deliverable_type = ?',
-    [taskId, 'file']
+    'SELECT * FROM task_deliverables WHERE task_id = ? AND deliverable_type IN (?, ?)',
+    [taskId, 'file', 'url']
   );
+
+  const fileDeliverables = deliverables.filter(d => d.deliverable_type === 'file');
+  const urlDeliverables = deliverables.filter(d => d.deliverable_type === 'url');
 
   return NextResponse.json({
     taskId,
     taskTitle: task.title,
     taskStatus: task.status,
     deliverableCount: deliverables.length,
-    testableFiles: deliverables
+    testableFiles: fileDeliverables
       .filter(d => d.path?.endsWith('.html') || d.path?.endsWith('.htm'))
       .map(d => ({ id: d.id, title: d.title, path: d.path })),
+    testableUrls: urlDeliverables.map(d => ({ id: d.id, title: d.title, path: d.path })),
+    validations: [
+      'JavaScript console error detection',
+      'CSS syntax validation (via css-tree)',
+      'Resource loading validation (images, scripts, stylesheets)',
+      'HTTP status code validation (for URL deliverables)'
+    ],
+    workflow: {
+      expectedStatus: 'testing',
+      onPass: 'Moves to review for human approval',
+      onFail: 'Moves to assigned for agent to fix issues'
+    },
     usage: {
       method: 'POST',
-      description: 'Run automated browser tests on all HTML deliverables',
-      returns: 'Test results with pass/fail, console errors, and screenshots'
+      description: 'Run automated browser tests on all HTML/URL deliverables',
+      returns: 'Test results with pass/fail, console errors, CSS errors, resource errors, and screenshots'
     }
   });
 }
