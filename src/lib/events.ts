@@ -4,6 +4,8 @@
  */
 
 import type { SSEEvent } from './types';
+import { onBroadcastEvent } from './bridge/event-listener';
+import { ensureBridgeInitialized } from './bridge/init';
 
 // Store active SSE client connections
 const clients = new Set<ReadableStreamDefaultController>();
@@ -26,6 +28,7 @@ export function unregisterClient(controller: ReadableStreamDefaultController): v
  * Broadcast an event to all connected SSE clients
  */
 export function broadcast(event: SSEEvent): void {
+  ensureBridgeInitialized();
   const encoder = new TextEncoder();
   const data = `data: ${JSON.stringify(event)}\n\n`;
   const encoded = encoder.encode(data);
@@ -43,6 +46,11 @@ export function broadcast(event: SSEEvent): void {
   }
 
   console.log(`[SSE] Broadcast ${event.type} to ${clients.size} client(s)`);
+
+  // Bridge hook: async sync to CRM (fire-and-forget)
+  onBroadcastEvent(event).catch((err) =>
+    console.error('[Bridge] Hook error:', err)
+  );
 }
 
 /**
